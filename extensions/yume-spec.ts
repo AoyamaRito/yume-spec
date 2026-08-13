@@ -27,7 +27,12 @@ import { execFileSync } from "node:child_process";
 // 「仕様(why) + コード版」の time-travel を、git との単一真実源で実現。
 function git(args: string[], cwd: string): string | null {
 	try {
-		return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }).trim();
+		return execFileSync("git", args, {
+			cwd,
+			encoding: "utf8",
+			maxBuffer: 8 * 1024 * 1024,
+			stdio: ["ignore", "pipe", "ignore"], // git の stderr は黙らせる（err は catch で握る）
+		}).trim();
 	} catch {
 		return null;
 	}
