@@ -50,16 +50,19 @@ function specLinesFrom(text: string): string[] {
 }
 
 // ---- 自動認知：yume系プロジェクトで、規約を毎ターンシステムプロンプトに注入する ----
-// （スキルはプログレッシブ開示で「読もうとしないと読まれない」。
-//   ここは before_agent_start で確実に毎回立ち、モデル依存ゼロで認知させる。）
+// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)を自動注入に追加。
+//       モデル依存ゼロで毎ターン認知させ、デグレ防止と自己完結検証を強制する。
+// @tags: SPEC
 const RULE = [
-	"[yume-min history rule / 規約]",
-	"コードを編集・新規作成するとき、その変更の仕様上の由来(why)をコメントでコードに内蔵せよ。",
-	"  書式: `// @why: <仕様の由来>（人間の要求 or 設計判断）`  構造意図は `// @tags: SPEC`",
-	"Scrap & Build でも @why コメントは絶対に消すな(Delete What, Keep Why)。",
-	"履歴は上書きせずappend。これで未来のどのAIもファイルを開くだけで仕様の変遷を読める。",
+	"[yume-min history & verification rule / 規約]",
+	"1. [why-in-band 規約] コード編集・作成時、仕様の由来(why)をコメントでコードに内蔵せよ。",
+	"   書式: `// @why: <仕様の由来>（人間の要求 or 設計判断）`  構造意図は `// @tags: SPEC`",
+	"   Scrap & Build でも @why コメントは消すな(Delete What, Keep Why)。過去を失わずappend積層。",
+	"2. [snowball E2E & Evidence 規約]",
+	"   機能を変更・追加したら、必ず e2e.mjs / test.js に snowball セクションを末尾追記し、最初から通しで全件PASSさせよ。",
+	"   主張(Claims)ではなく、実機テストの全PASSログ(Evidence)のみを完了・報告の根拠とせよ。",
 	"俯瞰: 必要なら `yspec [path]` ツールで全 @why/@tags:SPEC を一気に返せる。",
-	"[/yume-min history rule]",
+	"[/yume-min 規約]",
 ].join("\n");
 const YUME_SENTINEL = "yume-min 履歴規約";
 let sentinelCache: { cwd: string; hit: boolean } | null = null;
