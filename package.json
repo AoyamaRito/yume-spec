@@ -1,0 +1,14 @@
+{
+  "name": "yume-spec",
+  "version": "1.0.0",
+  "description": "Embed spec-why (@why) in code; auto-injects the convention into pi each turn; yspec/yhist overview tool + git-synced spec history (yume-min/ai-desk family).",
+  "keywords": ["pi-package", "yume", "yume-min", "ai-first", "spec", "docs-as-code"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
