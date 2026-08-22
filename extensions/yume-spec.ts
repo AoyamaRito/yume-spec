@@ -16,6 +16,7 @@
  * Install:
  *   - pi パッケージ: pi install ./yume-spec
  *   - グローバルリンク: ln -s /path/to/yume-spec/extensions/yume-spec.ts ~/.pi/agent/extensions/
+ *   - 単一ファイルコピー: cp extensions/yume-spec.ts ~/.pi/agent/extensions/
  *   - 有効化: pi で /reload
  */
 
@@ -23,26 +24,188 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { scanFile, walkDir, groupWhysByTarget, render, type Hit } from "../scan.js";
 
 // ---- git と同期した版履歴（並列ジャーナルは持たない）----
-// git を履歴源とし、各コミット時のコードから @why/@tags を抽出して重ねる =
-// 「仕様(why) + コード版」の time-travel を、git との単一真実源で実現。
 function git(args: string[], cwd: string): string | null {
 	try {
 		return execFileSync("git", args, {
 			cwd,
 			encoding: "utf8",
-			maxBuffer: 8 * 1024 * 1024,
-			stdio: ["ignore", "pipe", "ignore"], // git の stderr は黙らせる（err は catch で握る）
+			maxBuffer: 16 * 1024 * 1024,
+			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 	} catch {
 		return null;
 	}
 }
 
-// その版のコードに内蔵された spec/why 行だけを取り出す（本文は返さない・軽い）
+// ---- 内蔵 reason マーカー（コメント行に書く）----
+// @why: 文字列リテラルや説明文内の「@why」誤検知を防ぐため、コメント接頭辞（//, *, #, <!--, --）直後のマーカーのみを対象にする
+// @tags: SPEC
+const COMMENT_LINE_RE = /^\s*(?:\/\/|\*|#|<!--|--)\s*@(why|spec|tags|targets?)\b/i;
+const REASON_RE = /@(?:why|spec)\s*:\s*(.+)$/i;
+const SPEC_TAG_RE = /@tags\s*:\s*([^\s,，]+)/i;
+const TARGET_TAG_RE = /@targets?\s*:\s*([^\s,，]+)/i;
+
+// yume エンブレム境界（所属 BLOCK id の追跡に使用）
+const EMBLEM_OPEN_RE = /^\s*(?:\/\/|#|\*)\s*(?:>>>\s+)?BLOCK\s+(\S+)/;
+const EMBLEM_CLOSE_RE = /^\s*(?:\/\/|#|\*)\s*<<<\s*\/?BLOCK/;
+
+const EXT_SCAN = new Set([".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".md", ".py", ".go", ".rs", ".rb", ".html", ".yume.js"]);
+
+/**
+ * 構文シグネチャから現在のスコープ名を自動判定する正規表現群
+ */
+const SCOPE_PATTERNS = [
+	/^\s*(?:export\s+)?(?:async\s+)?function\s*\*?\s*([a-zA-Z0-9_$]+)\s*\(/,
+	/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z0-9_$]+)\s*=>/,
+	/^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?function/,
+	/^\s*(?:export\s+)?class\s+([a-zA-Z0-9_$]+)/,
+	/^\s*(?:(?:public|private|protected|static|async)\s+)*([a-zA-Z0-9_$]+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/,
+	/^\s*(?:test|describe|it)\s*\(\s*['"`]([^'"`]+)['"`]/,
+	/^\s*<([a-zA-Z0-9_-]+)(?:\s+[^>]*?(?:id=['"]([^'"]+)['"]|class=['"]([^'"]+)['"]))?[^>]*>/,
+	/^\s*([.#]?[a-zA-Z0-9_:-]+(?:\s*,\s*[.#]?[a-zA-Z0-9_:-]+)*)\s*\{/,
+];
+
+function extractScopeName(line: string): string | null {
+	const trimmed = line.trim();
+	if (trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("<!--")) return null;
+
+	let m = trimmed.match(SCOPE_PATTERNS[0]);
+	if (m) return `${m[1]}()`;
+	m = trimmed.match(SCOPE_PATTERNS[1]);
+	if (m) return `${m[1]}()`;
+	m = trimmed.match(SCOPE_PATTERNS[2]);
+	if (m) return `${m[1]}()`;
+	m = trimmed.match(SCOPE_PATTERNS[3]);
+	if (m) return `class ${m[1]}`;
+	m = trimmed.match(SCOPE_PATTERNS[5]);
+	if (m) return `test("${m[1]}")`;
+	m = trimmed.match(SCOPE_PATTERNS[4]);
+	if (m && !["if", "for", "while", "switch", "catch"].includes(m[1])) return `${m[1]}()`;
+	m = trimmed.match(SCOPE_PATTERNS[6]);
+	if (m) {
+		const tag = m[1];
+		const id = m[2];
+		const cls = m[3] ? m[3].split(" ")[0] : null;
+		if (id) return `<${tag}#${id}>`;
+		if (cls) return `<${tag}.${cls}>`;
+		return `<${tag}>`;
+	}
+	m = trimmed.match(SCOPE_PATTERNS[7]);
+	if (m && !trimmed.startsWith("@")) return m[1].trim();
+
+	return null;
+}
+
+export interface Hit {
+	file: string;
+	line: number;
+	block: string | null;
+	tags: string;
+	reason: string | null;
+	raw: string;
+}
+
+export function scanFile(absFile: string, relFile: string, hits: Hit[]): void {
+	let text: string;
+	try {
+		text = fs.readFileSync(absFile, "utf8");
+	} catch {
+		return;
+	}
+	const lines = text.split("\n");
+	let block: string | null = null;
+	const scopeStack: Array<{ name: string; line: number }> = [];
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const mOpen = line.match(EMBLEM_OPEN_RE);
+		const mClose = line.match(EMBLEM_CLOSE_RE);
+		if (mOpen) block = mOpen[1];
+		else if (mClose) block = null;
+
+		const detectedScope = extractScopeName(line);
+		if (detectedScope) {
+			scopeStack.push({ name: detectedScope, line: i + 1 });
+			if (scopeStack.length > 3) scopeStack.shift();
+		}
+
+		const trimmed = line.trim();
+		if (!COMMENT_LINE_RE.test(trimmed)) continue;
+
+		const targetMatch = line.match(TARGET_TAG_RE);
+		const explicitTarget = targetMatch ? targetMatch[1] : null;
+
+		const reason = line.match(REASON_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
+		const tag = line.match(SPEC_TAG_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
+		if (!reason && !tag && !explicitTarget) continue;
+
+		let target = explicitTarget || block;
+		if (!target && scopeStack.length > 0) {
+			const currentScope = scopeStack[scopeStack.length - 1].name;
+			target = `${relFile}#${currentScope}`;
+		}
+
+		hits.push({
+			file: relFile,
+			line: i + 1,
+			block: target,
+			tags: tag ?? "",
+			reason,
+			raw: trimmed.slice(0, 200),
+		});
+	}
+}
+
+function walkDir(absDir: string, relBase: string, hits: Hit[]): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(absDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	entries.sort((a, b) => a.name.localeCompare(b.name));
+	for (const e of entries) {
+		if (e.name === "node_modules" || e.name === ".git" || e.name === ".yume" || e.name.startsWith(".")) continue;
+		const abs = path.join(absDir, e.name);
+		const rel = path.join(relBase, e.name);
+		if (e.isDirectory()) walkDir(abs, rel, hits);
+		else if (EXT_SCAN.has(path.extname(e.name)) || e.name.endsWith(".yume.js")) scanFile(abs, rel, hits);
+	}
+}
+
+export function groupWhysByTarget(hits: Hit[]) {
+	const groups = new Map<string, { target: string; file: string; whys: Array<{ line: number; text: string }> }>();
+	for (const h of hits) {
+		if (!h.reason) continue;
+		const targetKey = h.block || (h.tags && h.tags !== "SPEC" ? `${h.file}@${h.tags}` : null);
+		if (!targetKey) continue;
+
+		if (!groups.has(targetKey)) {
+			groups.set(targetKey, { target: targetKey, file: h.file, whys: [] });
+		}
+		groups.get(targetKey)!.whys.push({ line: h.line, text: h.reason });
+	}
+	return Array.from(groups.values());
+}
+
+function render(hits: Hit[], showRaw: boolean): string {
+	if (hits.length === 0) {
+		return "（仕様/why マーカーが見つかりません。編集時は `// @why: <理由>` か `// @tags: SPEC` をコメントで内蔵してください）";
+	}
+	const out = hits.map((h) => {
+		const where = h.block ? `[target:${h.block}]` : "";
+		const tag = h.tags ? `@tags:${h.tags} ` : "";
+		const reason = h.reason ? `@why: ${h.reason}` : "";
+		const raw = showRaw && h.reason === null ? `\n        ↳ ${h.raw}` : "";
+		return `${h.file}:${h.line}  ${where} ${tag}${reason}${raw}`;
+	});
+	return out.join("\n");
+}
+
 function specLinesFrom(text: string): string[] {
 	const out: string[] = [];
 	for (const l of text.split("\n")) {
@@ -52,9 +215,115 @@ function specLinesFrom(text: string): string[] {
 	return out.slice(0, 8);
 }
 
+// @why: 決定論的 Presence ゲートのインライン実装
+// @tags: SPEC
+function checkWhyPresenceInline(cwd: string) {
+	let diff = git(["diff", "HEAD"], cwd);
+	if (diff == null || diff === "") {
+		diff = git(["diff", "--cached"], cwd) || git(["diff"], cwd) || "";
+	}
+	if (!diff || !diff.trim()) {
+		return { pass: true, totalFiles: 0, violations: [], note: "検査対象の差分がありません（クリーン）" };
+	}
+
+	const lines = diff.split("\n");
+	const files: Array<{ file: string; addedLines: string[] }> = [];
+	let currentFile: { file: string; addedLines: string[] } | null = null;
+
+	for (const line of lines) {
+		if (line.startsWith("diff --git ")) {
+			const parts = line.split(" ");
+			const bPath = parts[parts.length - 1] || "";
+			const cleanPath = bPath.replace(/^[ab]\//, "");
+			currentFile = { file: cleanPath, addedLines: [] };
+			files.push(currentFile);
+		} else if (line.startsWith("+") && !line.startsWith("+++")) {
+			if (currentFile) currentFile.addedLines.push(line.slice(1));
+		}
+	}
+
+	const violations: Array<{ file: string; message: string }> = [];
+	for (const f of files) {
+		const ext = path.extname(f.file);
+		if (!EXT_SCAN.has(ext) && !f.file.endsWith(".yume.js")) continue;
+
+		let addedCodeLines = 0;
+		let whyLinesAdded = 0;
+		for (const line of f.addedLines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			if (COMMENT_LINE_RE.test(trimmed) && REASON_RE.test(trimmed)) {
+				whyLinesAdded++;
+			} else {
+				addedCodeLines++;
+			}
+		}
+
+		if (addedCodeLines > 0 && whyLinesAdded === 0) {
+			violations.push({
+				file: f.file,
+				message: `コード変更が ${addedCodeLines} 行あるのに、仕様の由来を示す // @why: コメントが追加されていません`,
+			});
+		}
+	}
+
+	return { pass: violations.length === 0, totalFiles: files.length, violations };
+}
+
+// @why: Spec Collision Report 生成のインライン実装
+// @tags: SPEC
+function extractCollisionReportInline(groups: Array<{ target: string; file: string; whys: Array<{ line: number; text: string }> }>) {
+	const multiSpecTargets: Array<{ target: string; file: string; count: number; whys: Array<{ line: number; text: string; isLatest: boolean }> }> = [];
+	for (const g of groups) {
+		if (g.whys.length > 1) {
+			multiSpecTargets.push({
+				target: g.target,
+				file: g.file,
+				count: g.whys.length,
+				whys: g.whys.map((w, idx) => ({
+					line: w.line,
+					text: w.text,
+					isLatest: idx === g.whys.length - 1,
+				})),
+			});
+		}
+	}
+
+	const lines = [
+		"====================================================",
+		`📋 SPEC COLLISION REPORT (仕様変遷・整合性判断パケット)`,
+		`   判定対象ターゲット: ${groups.length} 件 (仕様変遷あり: ${multiSpecTargets.length} 件)`,
+		"====================================================",
+	];
+
+	if (multiSpecTargets.length === 0) {
+		lines.push("\n✨ 複数世代の仕様が積層しているターゲットはありません（全ターゲット単一仕様）。");
+	} else {
+		lines.push("\n💡 以下のターゲットで新旧の仕様（@why）が積層しています。");
+		lines.push("   作業中LLMは、最新の仕様が過去の重要要件（セキュリティ・再発防止策）を意図せず破壊（デグレ）していないか確認してください:\n");
+
+		multiSpecTargets.forEach((t, i) => {
+			lines.push(`${i + 1}. [ターゲット: ${t.target}] (${t.file}) — ${t.count} 世代の仕様:`);
+			t.whys.forEach((w, idx) => {
+				const isLatest = w.isLatest;
+				const prefix = idx === t.whys.length - 1 ? "   └─" : "   ├─";
+				const tag = isLatest ? "🔥 [最新]" : `📜 [過去(版${idx + 1})]`;
+				lines.push(`${prefix} ${tag} (L${w.line}) @why: ${w.text}`);
+			});
+			lines.push("");
+		});
+	}
+
+	return {
+		hasMultiSpecs: multiSpecTargets.length > 0,
+		totalTargets: groups.length,
+		multiSpecTargets,
+		report: lines.join("\n"),
+	};
+}
+
 // ---- 自動認知：yume系プロジェクトで、規約を毎ターンシステムプロンプトに注入する ----
 // @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)、Web UI検証(yui)、および決定論的 Presence ゲート(yspec presence=true)を自動注入に追加。
-//       モデル依存ゼロで毎ターン認知させ、デグレ防止・UI崩れ防止と自己完結検証を強制する。
 // @tags: SPEC
 const RULE = [
 	"[yume-min history & verification rule / 規約]",
@@ -72,7 +341,6 @@ const RULE = [
 const YUME_SENTINEL = "yume-min 履歴規約";
 let sentinelCache: { cwd: string; hit: boolean } | null = null;
 
-// cwd から git ルート / 祖先へ遡って、規約センチネル入り AGENTS.md か .pi/yume-min マーカーを探す。
 function isYumeProject(cwd: string): boolean {
 	if (sentinelCache && sentinelCache.cwd === cwd) return sentinelCache.hit;
 	let hit = false;
@@ -81,11 +349,9 @@ function isYumeProject(cwd: string): boolean {
 	for (let i = 0; i < 8; i++) {
 		if (seen.has(dir) || !dir) break;
 		seen.add(dir);
-		// 1) .pi/yume-min マーカー（明示オプトイン）
 		for (const marker of [path.join(dir, ".pi", "yume-min"), path.join(dir, ".yume-min")]) {
 			try { if (fs.statSync(marker).isFile()) { hit = true; break; } } catch {}
 		}
-		// 2) AGENTS.md に規約センチネル（自動オプトイン）
 		if (!hit) {
 			try {
 				const s = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
@@ -94,20 +360,16 @@ function isYumeProject(cwd: string): boolean {
 		}
 		if (hit) break;
 		const parent = path.dirname(dir);
-		if (parent === dir) break; // ルート到達
+		if (parent === dir) break;
 		dir = parent;
 	}
 	sentinelCache = { cwd, hit };
 	return hit;
 }
 
-// 内蔵 reason マーカーの抽出とターゲットグルーピングは ../scan.js に委譲
-// @tags: SPEC
-
 export default function (pi: ExtensionAPI) {
-	// 自動認知：yume系プロジェクトのターンで、規約を毎回システムプロンプトに注入。
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!isYumeProject(ctx.cwd)) return; // 無関係プロジェクトにはノイズを足さない
+		if (!isYumeProject(ctx.cwd)) return;
 		return { systemPrompt: event.systemPrompt + "\n\n" + RULE };
 	});
 
@@ -139,12 +401,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = ctx.cwd;
 
-			// @why: Keep Why を invariant にする決定論的 Presence ゲート。git diff を見て @why 欠落があれば即物理ブロック
-			// @tags: SPEC
+			// 1. Presence Gate
 			if (params.presence) {
-				const { checkWhyPresence } = await import("../presence.js");
-				const presResult = checkWhyPresence({ cwd });
-
+				const presResult = checkWhyPresenceInline(cwd);
 				const reportLines = [
 					"====================================================",
 					`🔒 SPEC PRESENCE GATE (Keep Why 不変項検証)`,
@@ -188,12 +447,10 @@ export default function (pi: ExtensionAPI) {
 				walkDir(absTarget, path.relative(cwd, absTarget) || ".", hits);
 			}
 
-			// @why: 仕様変遷・整合性判断パケット抽出（Spec Collision Report）。同一ターゲット内の新旧仕様を抽出し、作業中LLMに判断用レポートとして提示
-			// @tags: SPEC
+			// 2. Spec Collision Check
 			if (params.check) {
-				const { extractCollisionReport } = await import("../collision.js");
 				const groups = groupWhysByTarget(hits);
-				const collisionResult = extractCollisionReport(groups);
+				const collisionResult = extractCollisionReportInline(groups);
 
 				return {
 					content: [{ type: "text", text: collisionResult.report }],
@@ -231,7 +488,6 @@ export default function (pi: ExtensionAPI) {
 			const cwd = ctx.cwd;
 			const target = path.resolve(cwd, params.path);
 			const isFile = (() => { try { return fs.statSync(target).isFile(); } catch { return false; } })();
-			// リポジトリ判定は対象自身のディレクトリ起点（ネストされた独立repo対応）
 			const repoRoot = git(["rev-parse", "--show-toplevel"], isFile ? path.dirname(target) : target);
 			if (!repoRoot || !repoRoot.trim()) {
 				return {
@@ -290,7 +546,29 @@ export default function (pi: ExtensionAPI) {
 			const format = params.format ?? "tree";
 
 			try {
-				const { runUIGraph, renderTree, renderAnomalies, renderMermaid } = await import("../ui/index.js");
+				// 実体パスから ui/index.js を安全に探索して動的インポート
+				let uiModule: any = null;
+				const candPaths = [
+					path.resolve(cwd, "yume-spec/ui/index.js"),
+					path.resolve(cwd, "ui/index.js"),
+					path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../ui/index.js"),
+					path.resolve(fs.realpathSync(fileURLToPath(import.meta.url)), "../../ui/index.js"),
+				];
+				for (const cand of candPaths) {
+					if (fs.existsSync(cand)) {
+						uiModule = await import(`file://${cand}`);
+						break;
+					}
+				}
+
+				if (!uiModule) {
+					return {
+						content: [{ type: "text", text: "yui 実行エラー: yume-spec/ui/index.js が見つかりません。リポジトリ全体を保持するか npm/git 経由でインストールしてください。" }],
+						details: { error: "MODULE_NOT_FOUND" },
+					};
+				}
+
+				const { runUIGraph, renderTree, renderAnomalies, renderMermaid } = uiModule;
 				const graph = await runUIGraph(target, { mobile: isMobile, cwd });
 
 				let outText = "";
@@ -301,7 +579,6 @@ export default function (pi: ExtensionAPI) {
 				} else if (format === "scan") {
 					outText = renderAnomalies(graph);
 				} else {
-					// 既定: tree
 					outText = renderTree(graph) + "\n\n" + renderAnomalies(graph);
 				}
 
