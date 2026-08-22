@@ -1,4 +1,4 @@
-// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, 決定的Presenceゲート(presence), および状態三分割Spec Collision Checkerを実機検証する
+// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, 決定的Presenceゲート(presence), およびSpec Collision Packet抽出を実機検証する
 // @tags: SPEC
 
 import assert from 'node:assert';
@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runUIGraph, assertUIHealthy, renderTree, renderAnomalies, renderMermaid, findChromiumPath } from './ui/index.js';
-import { checkSpecCollisions } from './collision.js';
+import { extractCollisionReport } from './collision.js';
 import { checkWhyPresence } from './presence.js';
 import { scanFile, groupWhysByTarget, COMMENT_LINE_RE } from './scan.js';
 
@@ -100,67 +100,35 @@ diff --git a/app.js b/app.js
   assert.strictEqual(cleanRes.pass, true, 'Empty diff must PASS');
   console.log('  ✅ 6c Passed! (Clean diff passed)\n');
 
-  // Test 7: Spec Collision Advisory (3-state: PASS / FAIL / SKIP)
-  console.log('▶ [Test 7] Spec Collision Advisory (3-state PASS / FAIL / SKIP)');
-  // 7a: 正常進化 (PASS)
-  const passGroups = [
+  // Test 7: Spec Collision Report Generation (for in-band LLM evaluation)
+  console.log('▶ [Test 7] Spec Collision Report Generation (extractCollisionReport)');
+  const sampleGroups = [
     {
-      target: 'db:cache',
-      file: 'cache.js',
-      whys: [
-        { line: 10, text: '初期メモリキャッシュを導入' },
-        { line: 25, text: 'メモリ肥大化防止のためTTLとLRU破棄ロジックを追加' },
-      ],
-    },
-  ];
-  const collPassRes = await checkSpecCollisions(passGroups, {
-    evaluator: async (g) => ({ target: g.target, file: g.file, status: 'PASS' }),
-  });
-  assert.strictEqual(collPassRes.pass, true);
-  assert.strictEqual(collPassRes.summary.passCount, 1);
-  assert.strictEqual(collPassRes.summary.failCount, 0);
-  console.log('  ✅ 7a Passed! (Evolution -> PASS)');
-
-  // 7b: 矛盾・デグレ (FAIL)
-  const failGroups = [
-    {
-      target: 'security:auth',
+      target: 'app:auth',
       file: 'auth.js',
       whys: [
-        { line: 5, text: '不正ログイン脆弱性CVE-1234防止のためトークン認証を必須化' },
-        { line: 40, text: 'テストが面倒なためトークン認証を全廃し未認証アクセスを許可' },
+        { line: 5, text: '不正ログイン脆弱性防止のためトークン認証を必須化' },
+        { line: 40, text: 'テスト簡略化のため未認証アクセスを許可' },
       ],
     },
-  ];
-  const collFailRes = await checkSpecCollisions(failGroups, {
-    evaluator: async (g) => ({
-      target: g.target,
-      file: g.file,
-      status: 'FAIL',
-      reason: '過去の脆弱性防止要件（トークン認証必須化）を破壊しています',
-    }),
-  });
-  assert.strictEqual(collFailRes.pass, false);
-  assert.strictEqual(collFailRes.summary.failCount, 1);
-  console.log('  ✅ 7b Passed! (Contradiction -> FAIL)');
-
-  // 7c: APIキーなし / ネットワーク例外時の偽装防止 (SKIP)
-  const skipGroups = [
     {
-      target: 'ui:theme',
-      file: 'theme.js',
-      whys: [{ line: 1, text: 'ダークテーマ' }, { line: 2, text: 'ハイコントラスト' }],
+      target: 'db:single',
+      file: 'db.js',
+      whys: [{ line: 12, text: '単一DB接続初期化' }],
     },
   ];
-  const collSkipRes = await checkSpecCollisions(skipGroups, {
-    apiKey: null, // 明示的にキーなし
-  });
-  assert.strictEqual(collSkipRes.summary.skipCount, 1, 'Missing API key must be SKIP, not silently PASS');
-  assert.strictEqual(collSkipRes.results[0].status, 'SKIP');
-  console.log('  ✅ 7c Passed! (Missing key -> SKIP accurately reported, no silent green)');
+  const collReport = extractCollisionReport(sampleGroups);
+  assert.strictEqual(collReport.hasMultiSpecs, true, 'Must detect multi-spec targets');
+  assert.strictEqual(collReport.multiSpecTargets.length, 1, 'Only targets with >1 why should be extracted');
+  assert.strictEqual(collReport.multiSpecTargets[0].target, 'app:auth');
+  assert.strictEqual(collReport.multiSpecTargets[0].whys[1].isLatest, true);
+  assert.ok(collReport.report.includes('app:auth'), 'Report must contain target name');
+  assert.ok(collReport.report.includes('[最新]'), 'Report must mark latest spec');
+  assert.ok(collReport.report.includes('[過去(版1)]'), 'Report must mark historical spec');
+  console.log('  ✅ Test 7 Passed! (Collision packet formatted cleanly for in-band LLM judgment)\n');
 
   // Test 8: Cross-platform Chromium finder check
-  console.log('\n▶ [Test 8] Cross-platform Chromium finder');
+  console.log('▶ [Test 8] Cross-platform Chromium finder');
   const exe = findChromiumPath();
   assert.ok(exe, 'Chromium executable must be found on this platform');
   console.log(`  ✅ Test 8 Passed! (Found Chromium: ${exe})\n`);

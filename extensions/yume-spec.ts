@@ -115,7 +115,7 @@ export default function (pi: ExtensionAPI) {
 		name: "yspec",
 		label: "Yume Spec overview & presence/collision checker",
 		description:
-			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC` / `// @targets:`）をファイル順・出現順に一気に返す。`presence: true` でコード変更に対する @why の存在を決定論的検証（硬い物理ゲート）。`check: true` で同一ターゲット内の新旧仕様の論理矛盾を軽量LLMで検証（Advisory）。",
+			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC` / `// @targets:`）をファイル順・出現順に一気に返す。`presence: true` でコード変更に対する @why の存在を決定論的検証（硬い物理ゲート）。`check: true` で同一ターゲット内の新旧仕様変遷パケットを抽出し、作業中LLMに整合性判断用レポートを提示する。",
 		parameters: Type.Object({
 			path: Type.Optional(
 				Type.String({
@@ -132,7 +132,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			check: Type.Optional(
 				Type.Boolean({
-					description: "【仕様整合性Advisory】同一ターゲット内の新旧@whyの論理矛盾・デグレの疑いを軽量LLMで検証する（既定 false）",
+					description: "【仕様変遷パケット抽出】同一ターゲット内の新旧@why仕様変遷を抽出し、作業中LLMが論理矛盾やデグレを判断するためのレポートを出力する（既定 false）",
 				})
 			),
 		}),
@@ -188,34 +188,20 @@ export default function (pi: ExtensionAPI) {
 				walkDir(absTarget, path.relative(cwd, absTarget) || ".", hits);
 			}
 
-			// @why: 仕様矛盾検知（Spec Collision Advisory）。状態を PASS / FAIL / SKIP に正確に三分割して報告
+			// @why: 仕様変遷・整合性判断パケット抽出（Spec Collision Report）。同一ターゲット内の新旧仕様を抽出し、作業中LLMに判断用レポートとして提示
 			// @tags: SPEC
 			if (params.check) {
-				const { checkSpecCollisions } = await import("../collision.js");
+				const { extractCollisionReport } = await import("../collision.js");
 				const groups = groupWhysByTarget(hits);
-				const collisionResult = await checkSpecCollisions(groups);
-
-				const reportLines = [
-					"====================================================",
-					`🔍 SPEC COLLISION ADVISORY (仕様整合性・デグレ検証)`,
-					`   Status: ${collisionResult.pass ? "✅ PASS" : "🚨 WARNING (Contradiction detected)"}`,
-					`   Target Groups: ${collisionResult.summary.total} (Pass: ${collisionResult.summary.passCount}, Fail: ${collisionResult.summary.failCount}, Skip: ${collisionResult.summary.skipCount})`,
-					"====================================================",
-				];
-
-				for (const r of collisionResult.results) {
-					const icon = r.status === "PASS" ? "✅" : r.status === "FAIL" ? "🚨" : "⏭️";
-					reportLines.push(`\n${icon} [${r.target}] (${r.file}) -> [${r.status}]`);
-					if (r.reason) reportLines.push(`   理由: ${r.reason}`);
-					if (r.note) reportLines.push(`   備考: ${r.note}`);
-				}
+				const collisionResult = extractCollisionReport(groups);
 
 				return {
-					content: [{ type: "text", text: reportLines.join("\n") }],
+					content: [{ type: "text", text: collisionResult.report }],
 					details: {
-						pass: collisionResult.pass,
-						summary: collisionResult.summary,
-						results: collisionResult.results,
+						hasMultiSpecs: collisionResult.hasMultiSpecs,
+						totalTargets: collisionResult.totalTargets,
+						multiSpecCount: collisionResult.multiSpecTargets.length,
+						multiSpecTargets: collisionResult.multiSpecTargets,
 					},
 				};
 			}
