@@ -9,23 +9,58 @@ import { extractUIGraph } from './extractor.js';
 
 export { extractUIGraph };
 
-/* ---------- ブラウザ自動検出 ---------- */
+// @why: MacだけでなくLinux(CI環境)・Windows・システムChromeパスまで網羅し、環境依存なく動作するクロスプラットフォーム検出
+// @tags: SPEC
 export function findChromiumPath() {
-  if (process.env.UI_GRAPH_CHROME && existsSync(process.env.UI_GRAPH_CHROME)) return process.env.UI_GRAPH_CHROME;
-  if (process.env.WEBQA_CHROME && existsSync(process.env.WEBQA_CHROME)) return process.env.WEBQA_CHROME;
-  const cache = path.join(homedir(), 'Library/Caches/ms-playwright');
-  if (!existsSync(cache)) return null;
-  for (const prefix of ['chromium_headless_shell-', 'chromium-']) {
-    const dirs = readdirSync(cache).filter(d => d.startsWith(prefix)).sort();
-    for (const d of dirs.reverse()) {
-      const cand = prefix === 'chromium_headless_shell-'
-        ? path.join(cache, d, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell')
-        : [path.join(cache, d, 'chrome-mac', 'Chromium'), path.join(cache, d, 'chromium', 'chrome-mac', 'Chromium')];
-      for (const exe of Array.isArray(cand) ? cand : [cand]) {
-        if (existsSync(exe)) return exe;
+  // 1. 環境変数オーバーライド
+  for (const envKey of ['UI_GRAPH_CHROME', 'WEBQA_CHROME', 'CHROME_PATH', 'PUPPETEER_EXECUTABLE_PATH']) {
+    if (process.env[envKey] && existsSync(process.env[envKey])) return process.env[envKey];
+  }
+
+  // 2. Playwright キャッシュ探索 (Mac, Linux, Windows)
+  const home = homedir();
+  const cacheCandidates = [
+    path.join(home, 'Library/Caches/ms-playwright'), // macOS
+    path.join(home, '.cache/ms-playwright'),        // Linux
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'ms-playwright') : null, // Windows
+  ].filter(Boolean);
+
+  for (const cache of cacheCandidates) {
+    if (!existsSync(cache)) continue;
+    for (const prefix of ['chromium_headless_shell-', 'chromium-']) {
+      const dirs = readdirSync(cache).filter(d => d.startsWith(prefix)).sort();
+      for (const d of dirs.reverse()) {
+        const cands = [
+          path.join(cache, d, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell'),
+          path.join(cache, d, 'chrome-headless-shell-mac-x64', 'chrome-headless-shell'),
+          path.join(cache, d, 'chrome-mac', 'Chromium'),
+          path.join(cache, d, 'chromium', 'chrome-mac', 'Chromium'),
+          path.join(cache, d, 'chrome-linux', 'chrome'),
+          path.join(cache, d, 'chrome-headless-shell-linux', 'chrome-headless-shell'),
+          path.join(cache, d, 'chrome-win', 'chrome.exe'),
+          path.join(cache, d, 'chrome-headless-shell-win64', 'chrome-headless-shell.exe'),
+        ];
+        for (const cand of cands) {
+          if (existsSync(cand)) return cand;
+        }
       }
     }
   }
+
+  // 3. システム標準パス探索
+  const systemPaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+  for (const p of systemPaths) {
+    if (existsSync(p)) return p;
+  }
+
   return null;
 }
 

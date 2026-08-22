@@ -96,6 +96,8 @@ export function walkDir(absDir, relBase, hits) {
 
 /**
  * 仕様マーカーをターゲットごとにグルーピング（Spec Collision Check用）
+ * @why: target / BLOCK が未指定のファイルを無理にファイル全体1グループで相互比較すると、無関係な why 同士で誤判定が出るため、明示ターゲットがあるもの、または同一ターゲット内の積層のみを抽出する
+ * @tags: SPEC
  * @param {Hit[]} hits 
  * @returns {Array<{ target: string, file: string, whys: Array<{ line: number, text: string }> }>}
  */
@@ -103,7 +105,10 @@ export function groupWhysByTarget(hits) {
   const groups = new Map();
   for (const h of hits) {
     if (!h.reason) continue;
-    const targetKey = h.block || (h.tags && h.tags !== 'SPEC' ? h.tags : h.file);
+    // 明示的な block または target がある場合のみグループ化対象にする
+    const targetKey = h.block || (h.tags && h.tags !== 'SPEC' ? h.tags : null);
+    if (!targetKey) continue; // ターゲット指定のない独立whyはノイズ防止でスキップ
+
     if (!groups.has(targetKey)) {
       groups.set(targetKey, { target: targetKey, file: h.file, whys: [] });
     }

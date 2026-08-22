@@ -6,7 +6,9 @@
   "exports": {
     ".": "./extensions/yume-spec.ts",
     "./ui": "./ui/index.js",
-    "./collision": "./collision.js"
+    "./collision": "./collision.js",
+    "./presence": "./presence.js",
+    "./scan": "./scan.js"
   },
   "scripts": {
     "test": "node test.mjs"

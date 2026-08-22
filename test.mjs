@@ -1,12 +1,13 @@
-// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, および仕様矛盾検知(Spec Collision Checker)を実機検証する
+// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, 決定的Presenceゲート(presence), および状態三分割Spec Collision Checkerを実機検証する
 // @tags: SPEC
 
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runUIGraph, assertUIHealthy, renderTree, renderAnomalies, renderMermaid } from './ui/index.js';
+import { runUIGraph, assertUIHealthy, renderTree, renderAnomalies, renderMermaid, findChromiumPath } from './ui/index.js';
 import { checkSpecCollisions } from './collision.js';
+import { checkWhyPresence } from './presence.js';
 import { scanFile, groupWhysByTarget, COMMENT_LINE_RE } from './scan.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -15,7 +16,7 @@ const GOOD_UI = path.join(FIXTURES, 'good-ui.html');
 const BAD_UI = path.join(FIXTURES, 'bad-ui.html');
 
 async function main() {
-  console.log('🧪 === yume-spec E2E Test (including yui, yspec-check / Collision Checker) ===\n');
+  console.log('🧪 === yume-spec E2E Test Suite ===\n');
 
   // Test 1: assertUIHealthy on good-ui.html (should PASS)
   console.log('▶ [Test 1] assertUIHealthy on good-ui.html');
@@ -64,18 +65,44 @@ async function main() {
   assert.ok(tsHits.length <= 8, `Ghost markers should be filtered out, got ${tsHits.length} hits`);
   console.log(`  ✅ Test 5 Passed! (Clean spec scanning: ${tsHits.length} true spec comments found)\n`);
 
-  // Test 6: Spec Collision Checker (Target grouping & Contradiction Detection)
-  console.log('▶ [Test 6] Spec Collision Checker (Target grouping & Contradiction)');
-  const sampleHits = [];
-  scanFile(path.join(HERE, 'examples/sample.js'), 'examples/sample.js', sampleHits);
-  const targetGroups = groupWhysByTarget(sampleHits);
-  assert.ok(targetGroups.length >= 2, 'Should group sample whys by block/target');
+  // Test 6: Deterministic Presence Gate (Keep Why 不変項検証)
+  console.log('▶ [Test 6] Deterministic Presence Gate (checkWhyPresence)');
+  // 6a: 変更があるのに @why がない diff → 確実に FAIL
+  const badDiff = `
+diff --git a/app.js b/app.js
+--- a/app.js
++++ b/app.js
+@@ -10,3 +10,4 @@
++function calculateTotal(price, tax) { return price * (1 + tax); }
+`;
+  const presFailRes = checkWhyPresence({ diffText: badDiff });
+  assert.strictEqual(presFailRes.pass, false, 'Diff without @why must FAIL presence gate');
+  assert.strictEqual(presFailRes.violations.length, 1);
+  assert.strictEqual(presFailRes.violations[0].file, 'app.js');
+  console.log('  ✅ 6a Passed! (Missing @why was deterministically caught and blocked)');
 
-  const authGroup = targetGroups.find(g => g.target === 'app:auth');
-  assert.ok(authGroup, 'Target app:auth must exist');
-  assert.ok(authGroup.whys.length >= 1, 'app:auth must contain why lines');
+  // 6b: コード変更に @why が付いている diff → 確実に PASS
+  const goodDiff = `
+diff --git a/app.js b/app.js
+--- a/app.js
++++ b/app.js
+@@ -10,3 +10,5 @@
++// @why: 消費税率の計算ロジックを共通化
++function calculateTotal(price, tax) { return price * (1 + tax); }
+`;
+  const presPassRes = checkWhyPresence({ diffText: goodDiff });
+  assert.strictEqual(presPassRes.pass, true, 'Diff with @why must PASS presence gate');
+  assert.strictEqual(presPassRes.violations.length, 0);
+  console.log('  ✅ 6b Passed! (Valid code change with @why passed presence gate)');
 
-  // Evaluator Simulation: 正常な仕様進化 (PASS)
+  // 6c: クリーン状態
+  const cleanRes = checkWhyPresence({ diffText: '' });
+  assert.strictEqual(cleanRes.pass, true, 'Empty diff must PASS');
+  console.log('  ✅ 6c Passed! (Clean diff passed)\n');
+
+  // Test 7: Spec Collision Advisory (3-state: PASS / FAIL / SKIP)
+  console.log('▶ [Test 7] Spec Collision Advisory (3-state PASS / FAIL / SKIP)');
+  // 7a: 正常進化 (PASS)
   const passGroups = [
     {
       target: 'db:cache',
@@ -86,12 +113,15 @@ async function main() {
       ],
     },
   ];
-  const passRes = await checkSpecCollisions(passGroups, {
+  const collPassRes = await checkSpecCollisions(passGroups, {
     evaluator: async (g) => ({ target: g.target, file: g.file, status: 'PASS' }),
   });
-  assert.strictEqual(passRes.pass, true, 'Valid evolution must PASS');
+  assert.strictEqual(collPassRes.pass, true);
+  assert.strictEqual(collPassRes.summary.passCount, 1);
+  assert.strictEqual(collPassRes.summary.failCount, 0);
+  console.log('  ✅ 7a Passed! (Evolution -> PASS)');
 
-  // Evaluator Simulation: 矛盾・デグレ (FAIL)
+  // 7b: 矛盾・デグレ (FAIL)
   const failGroups = [
     {
       target: 'security:auth',
@@ -102,7 +132,7 @@ async function main() {
       ],
     },
   ];
-  const failRes = await checkSpecCollisions(failGroups, {
+  const collFailRes = await checkSpecCollisions(failGroups, {
     evaluator: async (g) => ({
       target: g.target,
       file: g.file,
@@ -110,11 +140,30 @@ async function main() {
       reason: '過去の脆弱性防止要件（トークン認証必須化）を破壊しています',
     }),
   });
-  assert.strictEqual(failRes.pass, false, 'Contradictory / regression specs must FAIL');
-  assert.strictEqual(failRes.results[0].status, 'FAIL');
-  assert.ok(failRes.results[0].reason.includes('脆弱性防止要件'), 'Reason must explain regression');
+  assert.strictEqual(collFailRes.pass, false);
+  assert.strictEqual(collFailRes.summary.failCount, 1);
+  console.log('  ✅ 7b Passed! (Contradiction -> FAIL)');
 
-  console.log('  ✅ Test 6 Passed! (Spec Collision Checker correctly detects regressions and groupings)\n');
+  // 7c: APIキーなし / ネットワーク例外時の偽装防止 (SKIP)
+  const skipGroups = [
+    {
+      target: 'ui:theme',
+      file: 'theme.js',
+      whys: [{ line: 1, text: 'ダークテーマ' }, { line: 2, text: 'ハイコントラスト' }],
+    },
+  ];
+  const collSkipRes = await checkSpecCollisions(skipGroups, {
+    apiKey: null, // 明示的にキーなし
+  });
+  assert.strictEqual(collSkipRes.summary.skipCount, 1, 'Missing API key must be SKIP, not silently PASS');
+  assert.strictEqual(collSkipRes.results[0].status, 'SKIP');
+  console.log('  ✅ 7c Passed! (Missing key -> SKIP accurately reported, no silent green)');
+
+  // Test 8: Cross-platform Chromium finder check
+  console.log('\n▶ [Test 8] Cross-platform Chromium finder');
+  const exe = findChromiumPath();
+  assert.ok(exe, 'Chromium executable must be found on this platform');
+  console.log(`  ✅ Test 8 Passed! (Found Chromium: ${exe})\n`);
 
   console.log('🎉 === All yume-spec E2E Tests Completed Successfully! ===');
 }

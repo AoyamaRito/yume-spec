@@ -53,20 +53,20 @@ function specLinesFrom(text: string): string[] {
 }
 
 // ---- 自動認知：yume系プロジェクトで、規約を毎ターンシステムプロンプトに注入する ----
-// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)、Web UI検証(yui)、および仕様矛盾検知(yspec --check)を自動注入に追加。
+// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)、Web UI検証(yui)、および決定論的 Presence ゲート(yspec presence=true)を自動注入に追加。
 //       モデル依存ゼロで毎ターン認知させ、デグレ防止・UI崩れ防止と自己完結検証を強制する。
 // @tags: SPEC
 const RULE = [
 	"[yume-min history & verification rule / 規約]",
-	"1. [why-in-band 規約] コード編集・作成時、仕様の由来(why)をコメントでコードに内蔵せよ。",
+	"1. [why-in-band 規約] コード編集・作成時、仕様の由来(why)をコメントでコードに内蔵せよ（必須不変項）。",
 	"   書式: `// @why: <仕様の由来>（人間の要求 or 設計判断）`  構造意図は `// @tags: SPEC` または `// @targets: <モジュール名>`",
 	"   Scrap & Build でも @why コメントは消すな(Delete What, Keep Why)。過去を失わずappend積層。",
 	"2. [snowball E2E & Evidence 規約]",
 	"   機能を変更・追加したら、必ず e2e.mjs / test.js に snowball セクションを末尾追記し、最初から通しで全件PASSさせよ。",
+	"   コード変更後は、`yspec presence=true` で @why 欠落ゼロを決定論的検証せよ。",
 	"   Web UIを変更・作成した場合は、`yui` ツールでレイアウト崩れ・遮蔽エラー0件を検証せよ。",
-	"   仕様変更時は、`yspec check=true` で過去要件との矛盾・デグレがないか当たり判定せよ。",
 	"   主張(Claims)ではなく、実機テストの全PASSログ(Evidence)のみを完了・報告の根拠とせよ。",
-	"俯瞰: `yspec [path]`（仕様why俯瞰 / check=trueで矛盾判定）, `yhist [path]`（版履歴）, `yui [path]`（UI健全性検査）",
+	"俯瞰: `yspec [path]`（仕様why俯瞰）, `yspec presence=true`（@why存在ゲート）, `yspec check=true`（仕様矛盾検査）, `yhist [path]`（版履歴）, `yui [path]`（UI健全性検査）",
 	"[/yume-min 規約]",
 ].join("\n");
 const YUME_SENTINEL = "yume-min 履歴規約";
@@ -113,9 +113,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "yspec",
-		label: "Yume Spec overview & collision checker",
+		label: "Yume Spec overview & presence/collision checker",
 		description:
-			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC` / `// @targets:`）をファイル順・出現順に一気に返す。`check: true` を指定すると、同一ターゲット（ブロック）内の新旧仕様の論理矛盾・デグレを軽量LLMで当たり判定（Spec Collision Check）し、矛盾があればFAILとしてブロックする。",
+			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC` / `// @targets:`）をファイル順・出現順に一気に返す。`presence: true` でコード変更に対する @why の存在を決定論的検証（硬い物理ゲート）。`check: true` で同一ターゲット内の新旧仕様の論理矛盾を軽量LLMで検証（Advisory）。",
 		parameters: Type.Object({
 			path: Type.Optional(
 				Type.String({
@@ -125,14 +125,49 @@ export default function (pi: ExtensionAPI) {
 			showRaw: Type.Optional(
 				Type.Boolean({ description: "理由行でない @tags 付き行の生行も見せる（既定 false）" })
 			),
+			presence: Type.Optional(
+				Type.Boolean({
+					description: "【硬い不変項ゲート】コード変更があるのに @why コメントが追加されていないファイルを git diff から決定論的に検出しブロックする（既定 false）",
+				})
+			),
 			check: Type.Optional(
 				Type.Boolean({
-					description: "仕様の当たり判定（Spec Collision Check）。同一ターゲット内の新旧@whyの論理矛盾・デグレを軽量LLMで検証する（既定 false）",
+					description: "【仕様整合性Advisory】同一ターゲット内の新旧@whyの論理矛盾・デグレの疑いを軽量LLMで検証する（既定 false）",
 				})
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = ctx.cwd;
+
+			// @why: Keep Why を invariant にする決定論的 Presence ゲート。git diff を見て @why 欠落があれば即物理ブロック
+			// @tags: SPEC
+			if (params.presence) {
+				const { checkWhyPresence } = await import("../presence.js");
+				const presResult = checkWhyPresence({ cwd });
+
+				const reportLines = [
+					"====================================================",
+					`🔒 SPEC PRESENCE GATE (Keep Why 不変項検証)`,
+					`   Status: ${presResult.pass ? "✅ PASS (All changed files have @why)" : "🚨 FAIL (Missing @why in changed code)"}`,
+					`   Total Changed Files: ${presResult.totalFiles}`,
+					"====================================================",
+				];
+
+				if (presResult.violations.length === 0) {
+					reportLines.push(presResult.note || "✨ すべてのコード変更に仕様の由来（// @why:）が正しく内蔵されています。");
+				} else {
+					presResult.violations.forEach((v, idx) => {
+						reportLines.push(`\n${idx + 1}. 🚨 [MISSING_WHY] ${v.file}`);
+						reportLines.push(`   詳細: ${v.message}`);
+					});
+				}
+
+				return {
+					content: [{ type: "text", text: reportLines.join("\n") }],
+					details: { pass: presResult.pass, violations: presResult.violations },
+				};
+			}
+
 			const target = params.path ?? ".";
 			const absTarget = path.isAbsolute(target) ? target : path.resolve(cwd, target);
 			const hits: Hit[] = [];
@@ -153,7 +188,7 @@ export default function (pi: ExtensionAPI) {
 				walkDir(absTarget, path.relative(cwd, absTarget) || ".", hits);
 			}
 
-			// @why: 仕様矛盾検知（Spec Collision Checker）。check: true の場合はターゲットごとにグループ化してLLM矛盾判定を実行
+			// @why: 仕様矛盾検知（Spec Collision Advisory）。状態を PASS / FAIL / SKIP に正確に三分割して報告
 			// @tags: SPEC
 			if (params.check) {
 				const { checkSpecCollisions } = await import("../collision.js");
@@ -162,22 +197,26 @@ export default function (pi: ExtensionAPI) {
 
 				const reportLines = [
 					"====================================================",
-					`🔍 SPEC COLLISION REPORT (仕様矛盾・デグレ当たり判定)`,
-					`   Status: ${collisionResult.pass ? "✅ PASS (No contradictions)" : "🚨 FAIL (Contradiction detected)"}`,
-					`   Target Groups Tested: ${collisionResult.totalGroups}`,
+					`🔍 SPEC COLLISION ADVISORY (仕様整合性・デグレ検証)`,
+					`   Status: ${collisionResult.pass ? "✅ PASS" : "🚨 WARNING (Contradiction detected)"}`,
+					`   Target Groups: ${collisionResult.summary.total} (Pass: ${collisionResult.summary.passCount}, Fail: ${collisionResult.summary.failCount}, Skip: ${collisionResult.summary.skipCount})`,
 					"====================================================",
 				];
 
 				for (const r of collisionResult.results) {
-					const icon = r.status === "PASS" ? "✅" : "🚨";
-					reportLines.push(`\n${icon} [${r.target}] (${r.file}) -> ${r.status}`);
+					const icon = r.status === "PASS" ? "✅" : r.status === "FAIL" ? "🚨" : "⏭️";
+					reportLines.push(`\n${icon} [${r.target}] (${r.file}) -> [${r.status}]`);
 					if (r.reason) reportLines.push(`   理由: ${r.reason}`);
 					if (r.note) reportLines.push(`   備考: ${r.note}`);
 				}
 
 				return {
 					content: [{ type: "text", text: reportLines.join("\n") }],
-					details: { pass: collisionResult.pass, results: collisionResult.results },
+					details: {
+						pass: collisionResult.pass,
+						summary: collisionResult.summary,
+						results: collisionResult.results,
+					},
 				};
 			}
 
