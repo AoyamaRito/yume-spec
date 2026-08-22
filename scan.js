@@ -1,4 +1,4 @@
-// @why: yspec のファイルスキャン・マーカー抽出およびターゲットグルーピング（Spec Collision Check用）のコアロジック
+// @why: 編集経路・構文スコープ（関数・クラス・UIセレクタ・テスト）から自動的に当たり判定ボックス（ターゲット）を生成し、明示的@targets不要で仕様衝突判定を全自動発火させる
 // @tags: SPEC
 
 import fs from 'node:fs';
@@ -19,17 +19,81 @@ export const EMBLEM_CLOSE_RE = /^\s*(?:\/\/|#|\*)\s*<<<\s*\/?BLOCK/;
 export const EXT_SCAN = new Set([".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".md", ".py", ".go", ".rs", ".rb", ".html", ".yume.js"]);
 
 /**
- * @typedef {Object} Hit
- * @property {string} file
- * @property {number} line
- * @property {string|null} block
- * @property {string} tags
- * @property {string|null} reason
- * @property {string} raw
+ * 構文シグネチャから現在のスコープ名を自動判定する正規表現群
  */
+const SCOPE_PATTERNS = [
+  // 1. 関数定義: function foo(...) / export function foo(...) / async function foo(...)
+  /^\s*(?:export\s+)?(?:async\s+)?function\s*\*?\s*([a-zA-Z0-9_$]+)\s*\(/,
+  // 2. 変数関数: const foo = (...) => / const foo = function(...)
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z0-9_$]+)\s*=>/,
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?function/,
+  // 3. クラス定義: class Foo / export class Foo
+  /^\s*(?:export\s+)?class\s+([a-zA-Z0-9_$]+)/,
+  // 4. クラスメソッド / オブジェクトメソッド: foo(...) { / async foo(...) {
+  /^\s*(?:(?:public|private|protected|static|async)\s+)*([a-zA-Z0-9_$]+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/,
+  // 5. テストフレームワーク: test('...', ...) / describe('...', ...) / it('...', ...)
+  /^\s*(?:test|describe|it)\s*\(\s*['"`]([^'"`]+)['"`]/,
+  // 6. HTMLタグ（IDまたはクラス付き）: <div id="foo"> / <button class="btn">
+  /^\s*<([a-zA-Z0-9_-]+)(?:\s+[^>]*?(?:id=['"]([^'"]+)['"]|class=['"]([^'"]+)['"]))?[^>]*>/,
+  // 7. CSS セレクタ: .btn-primary { / #login-box { / header {
+  /^\s*([.#]?[a-zA-Z0-9_:-]+(?:\s*,\s*[.#]?[a-zA-Z0-9_:-]+)*)\s*\{/,
+];
 
 /**
- * 1ファイルをスキャンして仕様マーカーを抽出
+ * 行テキストから構文スコープ名を抽出
+ * @param {string} line 
+ * @returns {string|null}
+ */
+export function extractScopeName(line) {
+  const trimmed = line.trim();
+  if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.startsWith('<!--')) {
+    return null;
+  }
+
+  // 1. 関数 / アロー関数
+  let m = trimmed.match(SCOPE_PATTERNS[0]);
+  if (m) return `${m[1]}()`;
+  m = trimmed.match(SCOPE_PATTERNS[1]);
+  if (m) return `${m[1]}()`;
+  m = trimmed.match(SCOPE_PATTERNS[2]);
+  if (m) return `${m[1]}()`;
+
+  // 2. クラス
+  m = trimmed.match(SCOPE_PATTERNS[3]);
+  if (m) return `class ${m[1]}`;
+
+  // 3. テスト
+  m = trimmed.match(SCOPE_PATTERNS[5]);
+  if (m) return `test("${m[1]}")`;
+
+  // 4. クラスメソッド
+  m = trimmed.match(SCOPE_PATTERNS[4]);
+  if (m && !['if', 'for', 'while', 'switch', 'catch'].includes(m[1])) {
+    return `${m[1]}()`;
+  }
+
+  // 5. HTML タグ
+  m = trimmed.match(SCOPE_PATTERNS[6]);
+  if (m) {
+    const tag = m[1];
+    const id = m[2];
+    const cls = m[3] ? m[3].split(' ')[0] : null;
+    if (id) return `<${tag}#${id}>`;
+    if (cls) return `<${tag}.${cls}>`;
+    return `<${tag}>`;
+  }
+
+  // 6. CSS セレクタ
+  m = trimmed.match(SCOPE_PATTERNS[7]);
+  if (m && !trimmed.startsWith('@')) {
+    return m[1].trim();
+  }
+
+  return null;
+}
+
+/**
+ * 1ファイルをスキャンして仕様マーカーと編集経路（スコープ）を抽出
  * @param {string} absFile 
  * @param {string} relFile 
  * @param {Hit[]} hits 
@@ -43,12 +107,24 @@ export function scanFile(absFile, relFile, hits) {
   }
   const lines = text.split('\n');
   let block = null;
+  const scopeStack = [];
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // BLOCK 構文の追跡
     const mOpen = line.match(EMBLEM_OPEN_RE);
     const mClose = line.match(EMBLEM_CLOSE_RE);
     if (mOpen) block = mOpen[1];
     else if (mClose) block = null;
+
+    // 構文スコープの自動検出
+    const detectedScope = extractScopeName(line);
+    if (detectedScope) {
+      scopeStack.push({ name: detectedScope, line: i + 1, depth: scopeStack.length });
+      // 深すぎるスタックは3階層までに制限
+      if (scopeStack.length > 3) scopeStack.shift();
+    }
 
     const trimmed = line.trim();
     if (!COMMENT_LINE_RE.test(trimmed)) continue;
@@ -60,10 +136,20 @@ export function scanFile(absFile, relFile, hits) {
     const tag = line.match(SPEC_TAG_RE)?.[1].replace(/-->\s*$/, '').trim() ?? null;
     if (!reason && !tag && !explicitTarget) continue;
 
+    // ターゲットの決定優先順位:
+    // 1. @targets: 明示指定
+    // 2. BLOCK 構文
+    // 3. 構文から自動抽出されたスコープ (例: "login()" や "class AuthService")
+    let target = explicitTarget || block;
+    if (!target && scopeStack.length > 0) {
+      const currentScope = scopeStack[scopeStack.length - 1].name;
+      target = `${relFile}#${currentScope}`;
+    }
+
     hits.push({
       file: relFile,
       line: i + 1,
-      block: explicitTarget || block,
+      block: target,
       tags: tag ?? '',
       reason,
       raw: trimmed.slice(0, 200),
@@ -96,7 +182,7 @@ export function walkDir(absDir, relBase, hits) {
 
 /**
  * 仕様マーカーをターゲットごとにグルーピング（Spec Collision Check用）
- * @why: target / BLOCK が未指定のファイルを無理にファイル全体1グループで相互比較すると、無関係な why 同士で誤判定が出るため、明示ターゲットがあるもの、または同一ターゲット内の積層のみを抽出する
+ * @why: 明示的な @targets だけでなく、自動抽出された構文スコープ（関数名/クラス名等）に基づいて衝突グループを自動生成する
  * @tags: SPEC
  * @param {Hit[]} hits 
  * @returns {Array<{ target: string, file: string, whys: Array<{ line: number, text: string }> }>}
@@ -105,9 +191,9 @@ export function groupWhysByTarget(hits) {
   const groups = new Map();
   for (const h of hits) {
     if (!h.reason) continue;
-    // 明示的な block または target がある場合のみグループ化対象にする
-    const targetKey = h.block || (h.tags && h.tags !== 'SPEC' ? h.tags : null);
-    if (!targetKey) continue; // ターゲット指定のない独立whyはノイズ防止でスキップ
+    // block (明示 @targets, BLOCK, または自動構文スコープ) をターゲットとする
+    const targetKey = h.block || (h.tags && h.tags !== 'SPEC' ? `${h.file}@${h.tags}` : null);
+    if (!targetKey) continue;
 
     if (!groups.has(targetKey)) {
       groups.set(targetKey, { target: targetKey, file: h.file, whys: [] });

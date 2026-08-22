@@ -1,4 +1,4 @@
-// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, 決定的Presenceゲート(presence), およびSpec Collision Packet抽出を実機検証する
+// @why: yume-spec の E2E snowball テスト。UI健全性(yui), 幽霊マーカー防止, 決定的Presenceゲート, Spec Collision Packet, および自動構文スコープ特定を実機検証する
 // @tags: SPEC
 
 import assert from 'node:assert';
@@ -14,6 +14,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.resolve(HERE, 'fixtures');
 const GOOD_UI = path.join(FIXTURES, 'good-ui.html');
 const BAD_UI = path.join(FIXTURES, 'bad-ui.html');
+const AUTO_SCOPE_SAMPLE = path.join(FIXTURES, 'auto-scope-sample.js');
 
 async function main() {
   console.log('🧪 === yume-spec E2E Test Suite ===\n');
@@ -132,6 +133,28 @@ diff --git a/app.js b/app.js
   const exe = findChromiumPath();
   assert.ok(exe, 'Chromium executable must be found on this platform');
   console.log(`  ✅ Test 8 Passed! (Found Chromium: ${exe})\n`);
+
+  // Test 9: Auto Scope Detection from Syntax Path (No explicit @targets needed!)
+  console.log('▶ [Test 9] Auto Scope Detection from Syntax Path (loginUser, PaymentProcessor)');
+  const autoHits = [];
+  scanFile(AUTO_SCOPE_SAMPLE, 'auto-scope-sample.js', autoHits);
+  const autoGroups = groupWhysByTarget(autoHits);
+
+  // 関数 loginUser() に属する why が自動的にグループ化されていること
+  const loginGroup = autoGroups.find(g => g.target.includes('loginUser()'));
+  assert.ok(loginGroup, 'loginUser() scope must be automatically detected as target');
+  assert.strictEqual(loginGroup.whys.length, 2, 'loginUser() must contain 2 accumulated whys');
+  assert.ok(loginGroup.whys[0].text.includes('トークン認証を必須化'));
+  assert.ok(loginGroup.whys[1].text.includes('未認証アクセスを許可'));
+
+  // クラスメソッド processPayment() に属する why が自動的にグループ化されていること
+  const payGroup = autoGroups.find(g => g.target.includes('processPayment()'));
+  assert.ok(payGroup, 'processPayment() scope must be automatically detected as target');
+  assert.strictEqual(payGroup.whys.length, 2, 'processPayment() must contain 2 accumulated whys');
+
+  const autoCollReport = extractCollisionReport(autoGroups);
+  assert.strictEqual(autoCollReport.multiSpecTargets.length, 2, 'Both auto scopes must be flagged for collision review');
+  console.log('  ✅ Test 9 Passed! (Functions and classes automatically act as collision hitboxes!)\n');
 
   console.log('🎉 === All yume-spec E2E Tests Completed Successfully! ===');
 }
