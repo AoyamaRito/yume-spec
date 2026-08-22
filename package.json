@@ -1,11 +1,12 @@
 {
   "name": "yume-spec",
-  "version": "1.1.0",
-  "description": "Embed spec-why (@why) in code; auto-injects the convention into pi each turn; yspec/yhist/yui overview tools + Web UI health & logical graph inspector (yume-min/ai-desk family).",
+  "version": "1.2.0",
+  "description": "Embed spec-why (@why) in code; auto-injects the convention into pi each turn; yspec/yhist/yui overview tools + spec collision checker + Web UI health inspector (yume-min/ai-desk family).",
   "type": "module",
   "exports": {
     ".": "./extensions/yume-spec.ts",
-    "./ui": "./ui/index.js"
+    "./ui": "./ui/index.js",
+    "./collision": "./collision.js"
   },
   "scripts": {
     "test": "node test.mjs"

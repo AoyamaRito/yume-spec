@@ -24,6 +24,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
+import { scanFile, walkDir, groupWhysByTarget, render, type Hit } from "../scan.js";
 
 // ---- git と同期した版履歴（並列ジャーナルは持たない）----
 // git を履歴源とし、各コミット時のコードから @why/@tags を抽出して重ねる =
@@ -52,19 +53,20 @@ function specLinesFrom(text: string): string[] {
 }
 
 // ---- 自動認知：yume系プロジェクトで、規約を毎ターンシステムプロンプトに注入する ----
-// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)およびWeb UI検証(yui)を自動注入に追加。
+// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)、Web UI検証(yui)、および仕様矛盾検知(yspec --check)を自動注入に追加。
 //       モデル依存ゼロで毎ターン認知させ、デグレ防止・UI崩れ防止と自己完結検証を強制する。
 // @tags: SPEC
 const RULE = [
 	"[yume-min history & verification rule / 規約]",
 	"1. [why-in-band 規約] コード編集・作成時、仕様の由来(why)をコメントでコードに内蔵せよ。",
-	"   書式: `// @why: <仕様の由来>（人間の要求 or 設計判断）`  構造意図は `// @tags: SPEC`",
+	"   書式: `// @why: <仕様の由来>（人間の要求 or 設計判断）`  構造意図は `// @tags: SPEC` または `// @targets: <モジュール名>`",
 	"   Scrap & Build でも @why コメントは消すな(Delete What, Keep Why)。過去を失わずappend積層。",
 	"2. [snowball E2E & Evidence 規約]",
 	"   機能を変更・追加したら、必ず e2e.mjs / test.js に snowball セクションを末尾追記し、最初から通しで全件PASSさせよ。",
 	"   Web UIを変更・作成した場合は、`yui` ツールでレイアウト崩れ・遮蔽エラー0件を検証せよ。",
+	"   仕様変更時は、`yspec check=true` で過去要件との矛盾・デグレがないか当たり判定せよ。",
 	"   主張(Claims)ではなく、実機テストの全PASSログ(Evidence)のみを完了・報告の根拠とせよ。",
-	"俯瞰: `yspec [path]`（仕様why俯瞰）, `yhist [path]`（版履歴）, `yui [path]`（UI健全性検査）",
+	"俯瞰: `yspec [path]`（仕様why俯瞰 / check=trueで矛盾判定）, `yhist [path]`（版履歴）, `yui [path]`（UI健全性検査）",
 	"[/yume-min 規約]",
 ].join("\n");
 const YUME_SENTINEL = "yume-min 履歴規約";
@@ -99,92 +101,8 @@ function isYumeProject(cwd: string): boolean {
 	return hit;
 }
 
-// 内蔵 reason マーカー（コメント行に書く）
-// @why: 文字列リテラルや説明文内の「@why」誤検知を防ぐため、コメント接頭辞（//, *, #, <!--, --）直後のマーカーのみを対象にする
+// 内蔵 reason マーカーの抽出とターゲットグルーピングは ../scan.js に委譲
 // @tags: SPEC
-const COMMENT_LINE_RE = /^\s*(?:\/\/|\*|#|<!--|--)\s*@(why|spec|tags)\b/i;
-const REASON_RE = /@(?:why|spec)\s*:\s*(.+)$/i;
-const SPEC_TAG_RE = /@tags\s*:\s*([^\s,，]+)/i;
-const SRC_RE = /@src\s*:\s*([^\n]+)$/i;
-
-// yume エンブレム境界（所属 BLOCK id の追跡に使用）
-const EMBLEM_OPEN_RE = /^\s*(?:\/\/|#|\*)\s*(?:>>>\s+)?BLOCK\s+(\S+)/;
-const EMBLEM_CLOSE_RE = /^\s*(?:\/\/|#|\*)\s*<<<\s*\/?BLOCK/;
-
-const EXT_SCAN = new Set([".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".md", ".py", ".go", ".rs", ".rb", ".html", ".yume.js"]);
-
-interface Hit {
-	file: string; // 相対パス（cwd 基準）
-	line: number;
-	block: string | null; // 属する BLOCK id
-	tags: string;
-	reason: string | null;
-	raw: string;
-}
-
-function scanFile(absFile: string, relFile: string, hits: Hit[]): void {
-	let text: string;
-	try {
-		text = fs.readFileSync(absFile, "utf8");
-	} catch {
-		return;
-	}
-	const lines = text.split("\n");
-	let block: string | null = null;
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
-		const mOpen = line.match(EMBLEM_OPEN_RE);
-		const mClose = line.match(EMBLEM_CLOSE_RE);
-		if (mOpen) block = mOpen[1];
-		else if (mClose) block = null;
-
-		const trimmed = line.trim();
-		if (!COMMENT_LINE_RE.test(trimmed)) continue; // コメント先頭マーカー以外は無視
-
-		const reason = line.match(REASON_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
-		const tag = line.match(SPEC_TAG_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
-		if (!reason && !tag) continue;
-		hits.push({
-			file: relFile,
-			line: i + 1,
-			block,
-			tags: tag ?? "",
-			reason,
-			raw: trimmed.slice(0, 200),
-		});
-	}
-}
-
-function walkDir(absDir: string, relBase: string, hits: Hit[]): void {
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(absDir, { withFileTypes: true });
-	} catch {
-		return;
-	}
-	entries.sort((a, b) => a.name.localeCompare(b.name));
-	for (const e of entries) {
-		if (e.name === "node_modules" || e.name === ".git" || e.name === ".yume" || e.name.startsWith(".")) continue;
-		const abs = path.join(absDir, e.name);
-		const rel = path.join(relBase, e.name);
-		if (e.isDirectory()) walkDir(abs, rel, hits);
-		else if (EXT_SCAN.has(path.extname(e.name)) || e.name.endsWith(".yume.js")) scanFile(abs, rel, hits);
-	}
-}
-
-function render(hits: Hit[], showRaw: boolean): string {
-	if (hits.length === 0) {
-		return "（仕様/why マーカーが見つかりません。編集時は `// @why: <理由>` か `// @tags: SPEC` をコメントで内蔵してください）";
-	}
-	const out = hits.map((h) => {
-		const where = h.block ? `[block:${h.block}]` : "";
-		const tag = h.tags ? `@tags:${h.tags} ` : "";
-		const reason = h.reason ? `@why: ${h.reason}` : "";
-		const raw = showRaw && h.reason === null ? `\n        ↳ ${h.raw}` : "";
-		return `${h.file}:${h.line}  ${where} ${tag}${reason}${raw}`;
-	});
-	return out.join("\n");
-}
 
 export default function (pi: ExtensionAPI) {
 	// 自動認知：yume系プロジェクトのターンで、規約を毎回システムプロンプトに注入。
@@ -195,9 +113,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "yspec",
-		label: "Yume Spec overview",
+		label: "Yume Spec overview & collision checker",
 		description:
-			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC`）をファイル順・出現順に一気に返す。単一エンブレムや複数ファイル全体の仕様の変遷を見渡すための俯瞰（read-only）。「なぜこのコードはこうなっているか」を追いたい・仕様変更の履歴を確認したいときに使う。",
+			"yume-min -- ソースに内蔵された仕様のwhy（`// @why:` / `// @tags: SPEC` / `// @targets:`）をファイル順・出現順に一気に返す。`check: true` を指定すると、同一ターゲット（ブロック）内の新旧仕様の論理矛盾・デグレを軽量LLMで当たり判定（Spec Collision Check）し、矛盾があればFAILとしてブロックする。",
 		parameters: Type.Object({
 			path: Type.Optional(
 				Type.String({
@@ -206,6 +124,11 @@ export default function (pi: ExtensionAPI) {
 			),
 			showRaw: Type.Optional(
 				Type.Boolean({ description: "理由行でない @tags 付き行の生行も見せる（既定 false）" })
+			),
+			check: Type.Optional(
+				Type.Boolean({
+					description: "仕様の当たり判定（Spec Collision Check）。同一ターゲット内の新旧@whyの論理矛盾・デグレを軽量LLMで検証する（既定 false）",
+				})
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -228,6 +151,34 @@ export default function (pi: ExtensionAPI) {
 				scanFile(absTarget, rel || target, hits);
 			} else if (stat.isDirectory()) {
 				walkDir(absTarget, path.relative(cwd, absTarget) || ".", hits);
+			}
+
+			// @why: 仕様矛盾検知（Spec Collision Checker）。check: true の場合はターゲットごとにグループ化してLLM矛盾判定を実行
+			// @tags: SPEC
+			if (params.check) {
+				const { checkSpecCollisions } = await import("../collision.js");
+				const groups = groupWhysByTarget(hits);
+				const collisionResult = await checkSpecCollisions(groups);
+
+				const reportLines = [
+					"====================================================",
+					`🔍 SPEC COLLISION REPORT (仕様矛盾・デグレ当たり判定)`,
+					`   Status: ${collisionResult.pass ? "✅ PASS (No contradictions)" : "🚨 FAIL (Contradiction detected)"}`,
+					`   Target Groups Tested: ${collisionResult.totalGroups}`,
+					"====================================================",
+				];
+
+				for (const r of collisionResult.results) {
+					const icon = r.status === "PASS" ? "✅" : "🚨";
+					reportLines.push(`\n${icon} [${r.target}] (${r.file}) -> ${r.status}`);
+					if (r.reason) reportLines.push(`   理由: ${r.reason}`);
+					if (r.note) reportLines.push(`   備考: ${r.note}`);
+				}
+
+				return {
+					content: [{ type: "text", text: reportLines.join("\n") }],
+					details: { pass: collisionResult.pass, results: collisionResult.results },
+				};
 			}
 
 			const text = render(hits, params.showRaw ?? false);
