@@ -1,4 +1,4 @@
-// @why: yume-spec の E2E snowball テスト。yui (UI健全性検査 & ロジカルグラフ), assertUIHealthy, 横スクロール検知, data-yui-ignore を実機検証する
+// @why: yume-spec の E2E snowball テスト。単独配布時の完全自己完結性のため、fixtures はパッケージ内に内蔵（./fixtures）して実機検証する
 // @tags: SPEC
 
 import assert from 'node:assert';
@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { runUIGraph, assertUIHealthy, renderTree, renderAnomalies, renderMermaid } from './ui/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURES = path.resolve(HERE, '../ai-tools/ui-graph/fixtures');
+const FIXTURES = path.resolve(HERE, 'fixtures');
 const GOOD_UI = path.join(FIXTURES, 'good-ui.html');
 const BAD_UI = path.join(FIXTURES, 'bad-ui.html');
 

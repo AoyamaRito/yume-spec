@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Bad UI Test Fixture</title>
+  <!-- @why: ui-graph の検証用異常UIフィクスチャ（Overflow・Occlusion・Tiny Tap Target・Zero Box 等の典型バグを含む） -->
+  <!-- @tags: SPEC -->
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #fff; padding: 20px; }
+
+    /* バグ1: OVERFLOW_LEAK - 幅300pxの親から幅500pxの子がハミ出す */
+    .overflow-container {
+      width: 300px;
+      height: 100px;
+      border: 2px solid red;
+      margin-bottom: 30px;
+      overflow: visible; /* 親はvisibleなのに子が巨大 */
+    }
+    .wide-child {
+      width: 500px;
+      height: 60px;
+      background: rgba(255, 0, 0, 0.2);
+    }
+
+    /* バグ2: INTERACTION_OCCLUDED - 透明なオーバーレイがボタンを遮蔽 */
+    .button-container {
+      position: relative;
+      margin-bottom: 30px;
+      padding: 10px;
+      border: 1px solid #ccc;
+    }
+    .covered-btn {
+      padding: 10px 20px;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .invisible-blocker {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 200px;
+      height: 60px;
+      background: rgba(0, 0, 0, 0.01); /* ほぼ透明 */
+      z-index: 99; /* ボタンより上に来てクリックを妨害 */
+    }
+
+    /* バグ3: TINY_TAP_TARGET - クリック領域が 8x8px しかない */
+    .tiny-btn {
+      width: 10px;
+      height: 10px;
+      background: #333;
+      display: inline-block;
+      cursor: pointer;
+      margin-bottom: 30px;
+    }
+
+    /* バグ4: ZERO_BOX_WITH_CONTENT - height 0 なのにテキストを含む */
+    .zero-box-parent {
+      height: 0px;
+      overflow: visible;
+      background: yellow;
+      margin-bottom: 30px;
+    }
+
+    /* バグ5: VIEWPORT_HORIZONTAL_OVERFLOW - 画面幅1280pxを超える2000pxの巨大要素 */
+    .viewport-overflow-box {
+      width: 2000px;
+      height: 40px;
+      background: purple;
+      color: white;
+      margin-bottom: 30px;
+    }
+
+    /* 正当な意図的デザイン: data-yui-ignore でオプトアウト */
+    .intentional-overflow-badge {
+      width: 400px;
+      height: 30px;
+      background: orange;
+    }
+  </style>
+</head>
+<body>
+  <h1>Bad UI Sample</h1>
+
+  <!-- 1. はみ出し -->
+  <div class="overflow-container" id="box-overflow">
+    <div class="wide-child" id="child-wide">This element overflows by 200px</div>
+  </div>
+
+  <!-- 2. 遮蔽されたボタン -->
+  <div class="button-container" id="box-blocked">
+    <button class="covered-btn" id="btn-covered">Click Me (Blocked)</button>
+    <div class="invisible-blocker" id="overlay-blocker"></div>
+  </div>
+
+  <!-- 3. 極小タップボタン -->
+  <div>
+    <button class="tiny-btn" id="btn-tiny" title="Tiny Button"></button>
+  </div>
+
+  <!-- 4. ゼロサイズなのにコンテンツあり -->
+  <div class="zero-box-parent" id="box-zero">
+    <p>Ghost content inside zero-height parent</p>
+  </div>
+
+  <!-- 5. ページ全体の横スクロール -->
+  <div class="viewport-overflow-box" id="box-viewport-overflow">
+    Giant box triggering horizontal viewport scrollbar (+720px)
+  </div>
+
+  <!-- 6. 意図的なオーバーフロー (data-yui-ignore で警告・エラー無視) -->
+  <div class="overflow-container" id="box-ignored-container" data-yui-ignore="overflow">
+    <div class="intentional-overflow-badge" id="child-badge-ignored">Intentional Badge (Ignored via data-yui-ignore)</div>
+  </div>
+</body>
+</html>
