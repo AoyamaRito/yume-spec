@@ -13,7 +13,10 @@
  * 一気に返す =「仕様の変遷の俯瞰」。
  * read-only。既存ツール(git/read/bash)に何も足さず、上の規約だけを実体化する。
  *
- * Install: ~/.pi/agent/extensions/yume-spec.ts (global) → pi で /reload
+ * Install:
+ *   - pi パッケージ: pi install ./yume-spec
+ *   - グローバルリンク: ln -s /path/to/yume-spec/extensions/yume-spec.ts ~/.pi/agent/extensions/
+ *   - 有効化: pi で /reload
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -50,8 +53,8 @@ function specLinesFrom(text: string): string[] {
 }
 
 // ---- 自動認知：yume系プロジェクトで、規約を毎ターンシステムプロンプトに注入する ----
-// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)を自動注入に追加。
-//       モデル依存ゼロで毎ターン認知させ、デグレ防止と自己完結検証を強制する。
+// @why: yume-min 履歴規約に加え、e2e snowball 検証規約(Evidence over Claims)およびWeb UI検証(yui)を自動注入に追加。
+//       モデル依存ゼロで毎ターン認知させ、デグレ防止・UI崩れ防止と自己完結検証を強制する。
 // @tags: SPEC
 const RULE = [
 	"[yume-min history & verification rule / 規約]",
@@ -60,8 +63,9 @@ const RULE = [
 	"   Scrap & Build でも @why コメントは消すな(Delete What, Keep Why)。過去を失わずappend積層。",
 	"2. [snowball E2E & Evidence 規約]",
 	"   機能を変更・追加したら、必ず e2e.mjs / test.js に snowball セクションを末尾追記し、最初から通しで全件PASSさせよ。",
+	"   Web UIを変更・作成した場合は、`yui` ツールでレイアウト崩れ・遮蔽エラー0件を検証せよ。",
 	"   主張(Claims)ではなく、実機テストの全PASSログ(Evidence)のみを完了・報告の根拠とせよ。",
-	"俯瞰: 必要なら `yspec [path]` ツールで全 @why/@tags:SPEC を一気に返せる。",
+	"俯瞰: `yspec [path]`（仕様why俯瞰）, `yhist [path]`（版履歴）, `yui [path]`（UI健全性検査）",
 	"[/yume-min 規約]",
 ].join("\n");
 const YUME_SENTINEL = "yume-min 履歴規約";
@@ -283,6 +287,61 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: out.join("\n") }],
 				details: { count: commits.length },
 			};
+		},
+	});
+
+	// Web UI のロジカルグラフ・レイアウト崩れ・遮蔽検査（read-only）。
+	pi.registerTool({
+		name: "yui",
+		label: "Yume UI Health & Graph inspector",
+		description:
+			"yume-min -- Web UI（HTMLファイルまたはURL）からロジカルグラフ（包含/スタック/遮蔽/A11y）を自動抽出し、はみ出し（overflow）・ボタン遮蔽（occlusion）・極小タップ領域・ゼロサイズ縮退などのレイアウト破綻を即時検出し合否判定する（read-only）。Web UIの作成・編集時に自律検証するために使う。",
+		parameters: Type.Object({
+			path: Type.String({ description: "対象のHTMLファイルパス（相対または絶対）またはURL。例: index.html または http://localhost:3000" }),
+			mobile: Type.Optional(Type.Boolean({ description: "モバイル画面（390x844）でテストするか（既定 false: 1280x800）" })),
+			format: Type.Optional(
+				Type.String({
+					description: "出力フォーマット: 'tree'（階層ツリー+異常マーク）, 'scan'（異常サマリーのみ）, 'mermaid'（グラフ図）, 'json'（完全データ）。既定: 'tree'",
+				})
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const cwd = ctx.cwd;
+			const target = params.path;
+			const isMobile = params.mobile ?? false;
+			const format = params.format ?? "tree";
+
+			try {
+				const { runUIGraph, renderTree, renderAnomalies, renderMermaid } = await import("../ui/index.js");
+				const graph = await runUIGraph(target, { mobile: isMobile, cwd });
+
+				let outText = "";
+				if (format === "json") {
+					outText = JSON.stringify(graph, null, 2);
+				} else if (format === "mermaid") {
+					outText = renderMermaid(graph);
+				} else if (format === "scan") {
+					outText = renderAnomalies(graph);
+				} else {
+					// 既定: tree
+					outText = renderTree(graph) + "\n\n" + renderAnomalies(graph);
+				}
+
+				return {
+					content: [{ type: "text", text: outText }],
+					details: {
+						pass: graph.summary.pass,
+						errors: graph.summary.errorCount,
+						warnings: graph.summary.warnCount,
+						nodes: graph.summary.totalNodes,
+					},
+				};
+			} catch (err: any) {
+				return {
+					content: [{ type: "text", text: `yui 実行エラー: ${err.message}` }],
+					details: { error: err.message },
+				};
+			}
 		},
 	});
 }
