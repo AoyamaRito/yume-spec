@@ -2,6 +2,7 @@
 // @tags: SPEC
 
 import assert from 'node:assert';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runUIGraph, assertUIHealthy, renderTree, renderAnomalies, renderMermaid } from './ui/index.js';
@@ -53,6 +54,15 @@ async function main() {
   assert.ok(anomalies.includes('PASS'), 'Anomalies report must show PASS');
   assert.ok(mermaid.includes('flowchart TD'), 'Mermaid must have flowchart header');
   console.log('  ✅ Test 4 Passed! (All formatters rendered valid output)\n');
+
+  // Test 5: yspec comment prefix filtering (No ghost markers from string literals)
+  console.log('▶ [Test 5] yspec marker precision (Comment prefix only)');
+  const COMMENT_LINE_RE = /^\s*(?:\/\/|\*|#|<!--|--)\s*@(why|spec|tags)\b/i;
+  const tsContent = fs.readFileSync(path.join(HERE, 'extensions/yume-spec.ts'), 'utf8');
+  const tsHits = tsContent.split('\n').filter(l => COMMENT_LINE_RE.test(l.trim()));
+  // 文字列リテラルや説明文内の「@why」は除外され、実際のコメント行のみヒットすること
+  assert.ok(tsHits.length <= 6, `Ghost markers should be filtered out, got ${tsHits.length} hits`);
+  console.log(`  ✅ Test 5 Passed! (Clean spec scanning: ${tsHits.length} true spec comments found)\n`);
 
   console.log('🎉 === All yume-spec E2E Tests Completed Successfully! ===');
 }

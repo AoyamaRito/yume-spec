@@ -46,8 +46,7 @@ function specLinesFrom(text: string): string[] {
 	const out: string[] = [];
 	for (const l of text.split("\n")) {
 		const t = l.trim();
-		if (REASON_RE.test(t)) out.push("    " + t.slice(0, 160));
-		else if (SPEC_TAG_RE.test(t)) out.push("    " + t.slice(0, 160));
+		if (COMMENT_LINE_RE.test(t)) out.push("    " + t.slice(0, 160));
 	}
 	return out.slice(0, 8);
 }
@@ -101,9 +100,9 @@ function isYumeProject(cwd: string): boolean {
 }
 
 // 内蔵 reason マーカー（コメント行に書く）
-// - @why:     仕様変更の理由（人間の要求 or AIの設計判断）
-// - @spec:    仕様・意図の明示
-// - @tags: SPEC  アーキテクチャ上の仕様タグ（ai-desk の // @tags: SPEC に相当）
+// @why: 文字列リテラルや説明文内の「@why」誤検知を防ぐため、コメント接頭辞（//, *, #, <!--, --）直後のマーカーのみを対象にする
+// @tags: SPEC
+const COMMENT_LINE_RE = /^\s*(?:\/\/|\*|#|<!--|--)\s*@(why|spec|tags)\b/i;
 const REASON_RE = /@(?:why|spec)\s*:\s*(.+)$/i;
 const SPEC_TAG_RE = /@tags\s*:\s*([^\s,，]+)/i;
 const SRC_RE = /@src\s*:\s*([^\n]+)$/i;
@@ -112,7 +111,7 @@ const SRC_RE = /@src\s*:\s*([^\n]+)$/i;
 const EMBLEM_OPEN_RE = /^\s*(?:\/\/|#|\*)\s*(?:>>>\s+)?BLOCK\s+(\S+)/;
 const EMBLEM_CLOSE_RE = /^\s*(?:\/\/|#|\*)\s*<<<\s*\/?BLOCK/;
 
-const EXT_SCAN = new Set([".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".md", ".py", ".go", ".rs", ".rb", ".yume.js"]);
+const EXT_SCAN = new Set([".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".md", ".py", ".go", ".rs", ".rb", ".html", ".yume.js"]);
 
 interface Hit {
 	file: string; // 相対パス（cwd 基準）
@@ -139,8 +138,11 @@ function scanFile(absFile: string, relFile: string, hits: Hit[]): void {
 		if (mOpen) block = mOpen[1];
 		else if (mClose) block = null;
 
-		const reason = line.match(REASON_RE)?.[1].trim() ?? null;
-		const tag = line.match(SPEC_TAG_RE)?.[1] ?? null;
+		const trimmed = line.trim();
+		if (!COMMENT_LINE_RE.test(trimmed)) continue; // コメント先頭マーカー以外は無視
+
+		const reason = line.match(REASON_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
+		const tag = line.match(SPEC_TAG_RE)?.[1].replace(/-->\s*$/, "").trim() ?? null;
 		if (!reason && !tag) continue;
 		hits.push({
 			file: relFile,
@@ -148,7 +150,7 @@ function scanFile(absFile: string, relFile: string, hits: Hit[]): void {
 			block,
 			tags: tag ?? "",
 			reason,
-			raw: line.trim().slice(0, 200),
+			raw: trimmed.slice(0, 200),
 		});
 	}
 }
